@@ -1,6 +1,7 @@
 #!name=工单自动接取与通知
 #!desc=每天北京时间08:00到16:00，间隔6分钟自动接取全部类型工单，接单成功后发送系统通知。
+#!arguments=loginid:登录手机号,userid:系统用户ID,username:员工姓名
 
 [Script]
-工单自动接单-主频 = type=cron,cronexp="*/6 8-15 * * *",wake-system=true,timeout=15,script-path=https://raw.githubusercontent.com/eielyving/surge-workorder-monitor/main/workorder-auto-claim.js,script-update-interval=86400
-工单自动接单-16点收尾 = type=cron,cronexp="0 16 * * *",wake-system=true,timeout=15,script-path=https://raw.githubusercontent.com/eielyving/surge-workorder-monitor/main/workorder-auto-claim.js,script-update-interval=86400
+工单自动接单-主频 = type=cron,cronexp="*/6 8-15 * * *",wake-system=true,timeout=30,argument="loginid={{{loginid}}}&userid={{{userid}}}&username={{{username}}}",script-path=https://raw.githubusercontent.com/eielyving/surge-workorder-monitor/main/workorder-auto-claim.js,script-update-interval=86400
+工单自动接单-16点收尾 = type=cron,cronexp="0 16 * * *",wake-system=true,timeout=30,argument="loginid={{{loginid}}}&userid={{{userid}}}&username={{{username}}}",script-path=https://raw.githubusercontent.com/eielyving/surge-workorder-monitor/main/workorder-auto-claim.js,script-update-interval=86400
