@@ -2,5 +2,5 @@
 #!desc=每天北京时间08:00到16:00，间隔6分钟读取当日所有类型工单，只记录状态和业务类别数量；不会接单或回复。
 
 [Script]
-工单只读监控-08至15点 = type=cron,cronexp="*/6 8-15 * * *",wake-system=true,timeout=15,script-path=https://raw.githubusercontent.com/eielyving/surge-workorder-monitor/main/workorder-monitor.js,script-update-interval=86400
-工单只读监控-16点收尾 = type=cron,cronexp="0 16 * * *",wake-system=true,timeout=15,script-path=https://raw.githubusercontent.com/eielyving/surge-workorder-monitor/main/workorder-monitor.js,script-update-interval=86400
+工单只读监控-08至15点 = type=cron,cronexp="*/6 8-15 * * *",wake-system=true,timeout=15,script-path=https://raw.githubusercontent.com/eielyving/surge-workorder-monitor/f94b301c001b4d01e6bea16c22b561b2a5e67735/workorder-monitor.js,script-update-interval=86400
+工单只读监控-16点收尾 = type=cron,cronexp="0 16 * * *",wake-system=true,timeout=15,script-path=https://raw.githubusercontent.com/eielyving/surge-workorder-monitor/f94b301c001b4d01e6bea16c22b561b2a5e67735/workorder-monitor.js,script-update-interval=86400
