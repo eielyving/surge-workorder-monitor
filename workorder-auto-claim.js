@@ -1,4 +1,4 @@
-// Surge iOS 自动接工单与通知脚本
+// Surge iOS 自动接工单与通知脚本 (增强版)
 // 运行环境: Surge iOS 5.20+ Pro (支持 wake-system 与 cron)
 // 目标系统: 供热客服派单系统 (http://www.lygr.net:9010/zhu2)
 
@@ -23,13 +23,13 @@
 
   var isWorkTime = (timeMinute >= 8 * 60 && timeMinute <= 16 * 60);
 
-  // 2. 解析身份参数 (优先从 Surge $argument 读取，杜绝代码硬编码隐私)
+  // 2. 解析身份参数并做有效性校验
   var params = parseArguments();
-  if (!params.loginid || !params.userid || !params.username) {
-    var errConfig = "未检测到身份参数配置，请在 Surge 模块参数中配置 loginid、userid、username！";
+  if (isInvalidParam(params.loginid) || isInvalidParam(params.userid) || isInvalidParam(params.username)) {
+    var errConfig = "未检测到有效身份参数配置。请在 Surge 模块配置中填入实际的 loginid、userid、username！";
     console.log("[" + dateStr + " " + timeStr + "] " + errConfig);
     if (isWorkTime && typeof $notification !== "undefined" && $notification.post) {
-      $notification.post("【工单脚本配置提示】", "缺少用户身份参数", errConfig);
+      $notification.post("【工单脚本配置提示】", "缺少有效用户身份参数", errConfig);
     }
     $done();
     return;
@@ -57,14 +57,14 @@
     claimedSet[String(id)] = true;
   });
 
-  // 4. 查询个人工作台（未接单 Tab 1）
+  // 4. 查询个人工作台（包含未接单 Tab 1 与处理中 Tab 2）
   var queryUrl = "http://www.lygr.net:9010/zhu2/app/weixin/myWork.jsp?xcflag=&loginid=" +
                  encodeURIComponent(params.loginid) +
                  "&workType=&smallType=&bugbarstr=&bigid=";
 
   $httpClient.get({
     url: queryUrl,
-    timeout: 12,
+    timeout: 8,
     headers: {
       "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
     }
@@ -92,7 +92,7 @@
     // 5. 解析未接单列表 (严格区分“列表为空”与“解析结构异常”)
     var unassignedOrders = null;
     try {
-      unassignedOrders = parseUnassignedOrders(body || "");
+      unassignedOrders = parseTabOrders(body || "", "query1");
     } catch (e) {
       var parseErrMsg = "页面结构匹配失败: " + String(e.message || e);
       console.log("[" + dateStr + " " + timeStr + "] 【解析异常警告】" + parseErrMsg);
@@ -116,7 +116,7 @@
       return;
     }
 
-    // 过滤掉今天已经接过的工单
+    // 过滤掉今天已经确认接过的工单
     var toClaim = unassignedOrders.filter(function (order) {
       return order && order.id && !claimedSet[String(order.id)];
     });
@@ -126,24 +126,23 @@
       return;
     }
 
-    console.log("[" + dateStr + " " + timeStr + "] 发现 " + toClaim.length + " 个待接新工单，正在执行自动接单...");
-    claimOrdersSequentially(toClaim, 0);
+    console.log("[" + dateStr + " " + timeStr + "] 发现 " + toClaim.length + " 个待接新工单，正在执行自动接单与二次确认...");
+    processOrdersSequentially(toClaim, 0);
   });
 
-  // 解析 myWork.jsp 中的 Tab 1 (未接单列表)
-  function parseUnassignedOrders(html) {
+  // 解析 myWork.jsp 中指定函数对应的工单数组 (query1=未接单, query2=处理中)
+  function parseTabOrders(html, funcName) {
     if (!html || typeof html !== "string") {
       throw new Error("页面响应为空");
     }
-    // 检查基本页面标记
-    if (html.indexOf("处理的工单") === -1 && html.indexOf("myWork") === -1 && html.indexOf("query1") === -1) {
+    if (html.indexOf("处理的工单") === -1 && html.indexOf("myWork") === -1 && html.indexOf(funcName) === -1) {
       throw new Error("响应非预期工单页面(缺少处理的工单标识)");
     }
-    var q1Idx = html.indexOf("function query1(");
-    if (q1Idx === -1) {
-      throw new Error("未定位到未接单函数 query1");
+    var fnIdx = html.indexOf("function " + funcName + "(");
+    if (fnIdx === -1) {
+      throw new Error("未定位到函数 " + funcName);
     }
-    var start = html.indexOf("var obj = [", q1Idx);
+    var start = html.indexOf("var obj = [", fnIdx);
     if (start === -1) {
       throw new Error("未定位到工单数据起始标记 (var obj = [)");
     }
@@ -159,8 +158,8 @@
     return arr;
   }
 
-  // 顺序执行接单，并支持“逐单立即持久化”与“业务返回校验”
-  function claimOrdersSequentially(orders, index) {
+  // 顺序执行接单，并进行“系统状态二次核实闭环”
+  function processOrdersSequentially(orders, index) {
     if (index >= orders.length) {
       $done();
       return;
@@ -178,48 +177,114 @@
 
     var claimUrl = "http://www.lygr.net:9010/zhu2/weixin/jiedanWork.action";
 
+    // 第一步：发送接单 POST 请求
     $httpClient.post({
       url: claimUrl,
-      timeout: 10,
+      timeout: 8,
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
       },
       body: postBody
     }, function (err, resp, data) {
-      var respBody = String(data || "").trim();
-      var isHttpOk = (!err && resp && resp.status >= 200 && resp.status < 300);
-      var isBizError = /fail|error|失败|错误|已被|重复|无权限|不存在/i.test(respBody);
-
-      if (isHttpOk && !isBizError) {
-        console.log("[" + dateStr + " " + timeStr + "] 工单接单成功！单号: " + (order.workordernum || workid));
-
-        // 关键改进：逐单成功立即持久化写入本地存储，防止后续超时丢失
-        record.claimedIds.push(workid);
-        claimedSet[workid] = true;
-        try {
-          $persistentStore.write(JSON.stringify(record), STORE_KEY);
-        } catch (_) {}
-
-        // 发送 iOS 系统锁屏通知
-        var title = "【自动接单成功】" + (order.bigName || "工单") + " - " + (order.smallName || "");
-        var subtitle = "单号: " + (order.workordernum || workid);
-        var content = "目标: " + (order.taskObject || "未知") + "\n派单时间: " + (order.createTime || timeStr);
-
+      if (err || !resp || resp.status < 200 || resp.status >= 300) {
+        var failErr = err ? String(err) : ("HTTP " + (resp ? resp.status : "无响应"));
+        console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 接单请求网络失败: " + failErr);
         if (typeof $notification !== "undefined" && $notification.post) {
-          $notification.post(title, subtitle, content);
+          $notification.post("【接单请求失败】", "工单 " + (order.workordernum || workid), failErr);
         }
-      } else {
-        var failReason = err ? String(err) : (isBizError ? ("业务返回错误: " + respBody) : ("HTTP " + (resp ? resp.status : "无响应")));
-        console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 接单未成功: " + failReason);
-        if (typeof $notification !== "undefined" && $notification.post) {
-          $notification.post("【接单未成功】", "工单 " + (order.workordernum || workid), failReason);
-        }
+        processOrdersSequentially(orders, index + 1);
+        return;
       }
 
-      // 继续接取下一单
-      claimOrdersSequentially(orders, index + 1);
+      // 第二步：向系统发起二次查询核实，确认该工单是否真实进入“处理中(Tab 2)”
+      verifyClaimSuccess(workid, function (verified, reason) {
+        if (verified) {
+          console.log("[" + dateStr + " " + timeStr + "] 工单接单状态二次核实成功！单号: " + (order.workordernum || workid));
+
+          // 逐单即时持久化，并检查 write 返回值
+          record.claimedIds.push(workid);
+          claimedSet[workid] = true;
+          try {
+            var saveOk = $persistentStore.write(JSON.stringify(record), STORE_KEY);
+            if (!saveOk) {
+              console.log("[" + dateStr + " " + timeStr + "] 【持久化警告】$persistentStore.write 返回失败");
+            }
+          } catch (eStore) {
+            console.log("[" + dateStr + " " + timeStr + "] 【持久化异常】" + eStore.message);
+          }
+
+          // 状态百分之百确认后，才发送成功的系统锁屏通知
+          var title = "【自动接单成功】" + (order.bigName || "工单") + " - " + (order.smallName || "");
+          var subtitle = "单号: " + (order.workordernum || workid);
+          var content = "目标: " + (order.taskObject || "未知") + "\n派单时间: " + (order.createTime || timeStr);
+
+          if (typeof $notification !== "undefined" && $notification.post) {
+            $notification.post(title, subtitle, content);
+          }
+        } else {
+          console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 二次核实未通过: " + reason);
+          if (typeof $notification !== "undefined" && $notification.post) {
+            $notification.post("【接单状态未确认】", "工单 " + (order.workordernum || workid), reason);
+          }
+        }
+
+        // 处理下一张工单
+        processOrdersSequentially(orders, index + 1);
+      });
     });
+  }
+
+  // 二次查询核实工单是否已进入当前用户的“处理中”列表 (Tab 2)
+  function verifyClaimSuccess(targetWorkId, callback) {
+    $httpClient.get({
+      url: queryUrl,
+      timeout: 8,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+      }
+    }, function (err, resp, body) {
+      if (err || !resp || resp.status !== 200 || !body) {
+        callback(false, "核实请求网络异常，无法确认服务端状态");
+        return;
+      }
+
+      try {
+        var inProgressOrders = parseTabOrders(body, "query2");
+        var matched = inProgressOrders.some(function (item) {
+          return item && String(item.id) === String(targetWorkId);
+        });
+
+        if (matched) {
+          callback(true, "已确认存在于处理中列表");
+          return;
+        }
+
+        // 若不在处理中，核查是否仍在未接单列表
+        var unassigned = parseTabOrders(body, "query1");
+        var stillPending = unassigned.some(function (item) {
+          return item && String(item.id) === String(targetWorkId);
+        });
+
+        if (stillPending) {
+          callback(false, "工单仍在未接单列表中，接单请求可能未被服务端执行");
+        } else {
+          callback(false, "工单不在处理中列表，可能已被其他人接单或取消");
+        }
+      } catch (eParse) {
+        callback(false, "核实解析异常: " + eParse.message);
+      }
+    });
+  }
+
+  // 校验参数是否属于无效占位符或空值
+  function isInvalidParam(val) {
+    if (!val || typeof val !== "string") return true;
+    var s = val.trim();
+    if (!s) return true;
+    if (s.indexOf("{") !== -1 || s.indexOf("}") !== -1) return true;
+    if (/登录|手机|用户|ID|员工|姓名|YOUR_|default/i.test(s)) return true;
+    return false;
   }
 
   // 解析 Surge $argument 参数
@@ -242,13 +307,6 @@
         }
       });
     }
-
-    // 过滤未被 Surge 替换的花括号占位符 (如 {{loginid}})
-    ["loginid", "userid", "username"].forEach(function (key) {
-      if (res[key] && (res[key].indexOf("{") !== -1 || res[key].indexOf("}") !== -1)) {
-        res[key] = "";
-      }
-    });
 
     // 本地持久化兜底（如果用户之前本地存过）
     if (!res.loginid && typeof $persistentStore !== "undefined") {
