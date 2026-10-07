@@ -297,7 +297,7 @@
         if (idx !== -1) {
           var k = pair.substring(0, idx).trim();
           var v = pair.substring(idx + 1).trim();
-          if (k) {
+          if (k && v && !isInvalidParam(v)) {
             try {
               res[k] = decodeURIComponent(v);
             } catch (_) {
