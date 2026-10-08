@@ -35,12 +35,16 @@
     return;
   }
 
-  // 3. 本地持久化去重记录
+  // 3. 本地持久化去重记录 (带严格防 null 结构校验)
   var STORE_KEY = "workorder_claimed_records_v1";
   var record = {};
   try {
-    record = JSON.parse($persistentStore.read(STORE_KEY) || "{}");
+    var rawStore = $persistentStore.read(STORE_KEY);
+    record = rawStore ? JSON.parse(rawStore) : {};
   } catch (_) {
+    record = {};
+  }
+  if (!record || typeof record !== "object") {
     record = {};
   }
 
@@ -77,6 +81,16 @@
       return;
     }
 
+    // 辅助防线：同步将已在“处理中(query2)”的工单加入 claimedSet，防止状态脱节
+    try {
+      var inProgressOrders = parseTabOrders(body || "", "query2");
+      inProgressOrders.forEach(function (item) {
+        if (item && item.id) {
+          claimedSet[String(item.id)] = true;
+        }
+      });
+    } catch (_) {}
+
     // 非工作时段 (如夜间手动测试)
     if (!isWorkTime) {
       console.log("[" + dateStr + " " + timeStr + "] [非工作时间自测] 供热系统连通正常，身份: " + params.username + "，当前待接工单数: " + unassignedOrders.length + " 件。08:00-16:00 将开启自动接单。");
@@ -90,9 +104,16 @@
       return;
     }
 
-    // 过滤掉今天已经确认接过的工单
-    var toClaim = unassignedOrders.filter(function (order) {
-      return order && order.id && !claimedSet[String(order.id)];
+    // 过滤掉今天已经确认接过的工单，并在本轮数据内按工单ID严格去重
+    var seenBatchIds = {};
+    var toClaim = [];
+    unassignedOrders.forEach(function (order) {
+      if (!order || !order.id) return;
+      var wid = String(order.id);
+      if (!claimedSet[wid] && !seenBatchIds[wid]) {
+        seenBatchIds[wid] = true;
+        toClaim.push(order);
+      }
     });
 
     if (toClaim.length === 0) {
@@ -100,20 +121,27 @@
       return;
     }
 
-    // 批次容量控制：单轮最多处理 2 张工单，防止多次请求超时（剩余工单将在下个 8 分钟周期处理，满足 20 分钟时限）
+    // FIFO 排序：优先处理最早派发的工单（按派单时间/单号升序，防旧单被新单反复延后）
+    toClaim.sort(function (a, b) {
+      var keyA = String(a.createTime || a.workordernum || a.id);
+      var keyB = String(b.createTime || b.workordernum || b.id);
+      return keyA.localeCompare(keyB);
+    });
+
+    // 批次容量控制：单轮最多处理 2 张工单，防止多次请求超时（剩余工单将在下个 8 分钟周期依序顺延接取）
     var MAX_BATCH = 2;
     var totalCount = toClaim.length;
     if (totalCount > MAX_BATCH) {
       toClaim = toClaim.slice(0, MAX_BATCH);
-      console.log("[" + dateStr + " " + timeStr + "] 发现 " + totalCount + " 个待接新工单，本轮优先处理前 " + MAX_BATCH + " 个，剩余将在下次轮询自动接取。");
+      console.log("[" + dateStr + " " + timeStr + "] 共有 " + totalCount + " 个待接新工单，已按派单时间排序，本轮优先处理最早派单的 " + MAX_BATCH + " 个，剩余将在下次轮询顺延接取。");
     } else {
-      console.log("[" + dateStr + " " + timeStr + "] 发现 " + totalCount + " 个待接新工单，正在执行自动接单与二次确认...");
+      console.log("[" + dateStr + " " + timeStr + "] 发现 " + totalCount + " 个待接新工单，正在按派单时间顺序执行接单与二次确认...");
     }
 
     processOrdersSequentially(toClaim, 0);
   });
 
-  // 工作台 GET 查询（带单次重试逻辑）
+  // 工作台 GET 查询（带单次 1 秒延迟自动重试逻辑）
   function fetchWorkBenchWithRetry(attempt, maxAttempts, onSuccess) {
     $httpClient.get({
       url: queryUrl,
@@ -190,6 +218,12 @@
     var workid = String(order.id);
     var telid = String(order.telid || "0");
 
+    // 防御性检查：若该工单已在本轮处理中被标记接单，直接跳过避免重复 POST
+    if (claimedSet[workid]) {
+      processOrdersSequentially(orders, index + 1);
+      return;
+    }
+
     var postBody = "userid=" + encodeURIComponent(params.userid) +
                    "&workid=" + encodeURIComponent(workid) +
                    "&username=" + encodeURIComponent(params.username) +
@@ -217,7 +251,7 @@
       }
 
       // 第二步：无论 POST 是否报错，均向系统发起二次查询核实（确认该工单是否真实进入“处理中(Tab 2)”）
-      verifyClaimSuccess(workid, function (verified, reason) {
+      verifyClaimSuccess(workid, function (verified, reason, isNetworkUncertain) {
         if (verified) {
           console.log("[" + dateStr + " " + timeStr + "] 工单接单状态核实成功！单号: " + (order.workordernum || workid) + (postErr ? " (注: POST网络虽有波动但服务端已成功接单)" : ""));
 
@@ -241,6 +275,12 @@
           if (typeof $notification !== "undefined" && $notification.post) {
             $notification.post(title, subtitle, content);
           }
+        } else if (isNetworkUncertain) {
+          // 复核请求网络受阻，状态待确认（避免误报接单失败）
+          console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 状态核验网络受阻: " + reason);
+          if (typeof $notification !== "undefined" && $notification.post) {
+            $notification.post("【接单状态待确认】", "工单 " + (order.workordernum || workid), "接单已发送但网络异常无法核对状态，系统可能已接单，请在网络恢复后查看或等待下轮检查");
+          }
         } else {
           var failSummary = postErr ? ("网络响应异常(" + postErr + ") 且 " + reason) : reason;
           console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 接单未确认: " + failSummary);
@@ -255,46 +295,63 @@
     });
   }
 
-  // 二次查询核实工单是否已进入“处理中”列表 (Tab 2)
+  // 二次查询核实工单是否已进入“处理中”列表 (Tab 2)，带单次 1 秒延迟自动重试
   function verifyClaimSuccess(targetWorkId, callback) {
-    $httpClient.get({
-      url: queryUrl,
-      timeout: 8,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
-      }
-    }, function (err, resp, body) {
-      if (err || !resp || resp.status !== 200 || !body) {
-        callback(false, "核实请求网络异常，无法确认服务端状态");
-        return;
-      }
-
-      try {
-        var inProgressOrders = parseTabOrders(body, "query2");
-        var matched = inProgressOrders.some(function (item) {
-          return item && String(item.id) === String(targetWorkId);
-        });
-
-        if (matched) {
-          callback(true, "已确认存在于处理中列表");
+    function doVerify(attempt) {
+      $httpClient.get({
+        url: queryUrl,
+        timeout: 8,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+        }
+      }, function (err, resp, body) {
+        if (err || !resp || resp.status !== 200 || !body) {
+          var errTxt = err ? String(err) : ("HTTP " + (resp ? resp.status : "无响应"));
+          if (attempt < 2) {
+            console.log("[" + dateStr + " " + timeStr + "] 工单 " + targetWorkId + " 状态复核初次请求异常 (" + errTxt + ")，1秒后自动重试核验...");
+            var retryFn = function () {
+              doVerify(attempt + 1);
+            };
+            if (typeof setTimeout === "function") {
+              setTimeout(retryFn, 1000);
+            } else {
+              retryFn();
+            }
+            return;
+          }
+          callback(false, "核实请求连续网络异常(" + errTxt + ")，服务端实际状态待确认", true);
           return;
         }
 
-        // 若不在处理中，核查是否仍在未接单列表
-        var unassigned = parseTabOrders(body, "query1");
-        var stillPending = unassigned.some(function (item) {
-          return item && String(item.id) === String(targetWorkId);
-        });
+        try {
+          var inProgressOrders = parseTabOrders(body, "query2");
+          var matched = inProgressOrders.some(function (item) {
+            return item && String(item.id) === String(targetWorkId);
+          });
 
-        if (stillPending) {
-          callback(false, "工单仍在未接单列表中，接单请求未被服务端执行");
-        } else {
-          callback(false, "工单不在处理中列表，可能已被其他人接单或取消");
+          if (matched) {
+            callback(true, "已确认存在于处理中列表", false);
+            return;
+          }
+
+          // 若不在处理中，核查是否仍在未接单列表
+          var unassigned = parseTabOrders(body, "query1");
+          var stillPending = unassigned.some(function (item) {
+            return item && String(item.id) === String(targetWorkId);
+          });
+
+          if (stillPending) {
+            callback(false, "工单仍在未接单列表中，接单请求未被服务端执行", false);
+          } else {
+            callback(false, "工单不在处理中列表，亦不在未接单列表", false);
+          }
+        } catch (eParse) {
+          callback(false, "核实解析异常: " + eParse.message, false);
         }
-      } catch (eParse) {
-        callback(false, "核实解析异常: " + eParse.message);
-      }
-    });
+      });
+    }
+
+    doVerify(1);
   }
 
   // 校验参数是否属于无效占位符或空值
