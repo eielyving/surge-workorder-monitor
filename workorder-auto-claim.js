@@ -57,38 +57,12 @@
     claimedSet[String(id)] = true;
   });
 
-  // 4. 查询个人工作台（包含未接单 Tab 1 与处理中 Tab 2）
+  // 4. 查询个人工作台（支持 1 秒延迟自动重试 1 次）
   var queryUrl = "http://www.lygr.net:9010/zhu2/app/weixin/myWork.jsp?xcflag=&loginid=" +
                  encodeURIComponent(params.loginid) +
                  "&workType=&smallType=&bugbarstr=&bigid=";
 
-  $httpClient.get({
-    url: queryUrl,
-    timeout: 8,
-    headers: {
-      "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
-    }
-  }, function (error, response, body) {
-    if (error) {
-      var netErr = "网络请求失败: " + String(error);
-      console.log("[" + dateStr + " " + timeStr + "] " + netErr);
-      if (isWorkTime && typeof $notification !== "undefined" && $notification.post) {
-        $notification.post("【工单网络异常】", "连接供热系统失败", netErr);
-      }
-      $done();
-      return;
-    }
-
-    if (!response || response.status < 200 || response.status >= 300) {
-      var httpErr = "供热系统返回 HTTP " + (response ? response.status : "无响应");
-      console.log("[" + dateStr + " " + timeStr + "] " + httpErr);
-      if (isWorkTime && typeof $notification !== "undefined" && $notification.post) {
-        $notification.post("【工单服务异常】", "HTTP 状态码错误", httpErr);
-      }
-      $done();
-      return;
-    }
-
+  fetchWorkBenchWithRetry(1, 2, function (body) {
     // 5. 解析未接单列表 (严格区分“列表为空”与“解析结构异常”)
     var unassignedOrders = null;
     try {
@@ -126,9 +100,56 @@
       return;
     }
 
-    console.log("[" + dateStr + " " + timeStr + "] 发现 " + toClaim.length + " 个待接新工单，正在执行自动接单与二次确认...");
+    // 批次容量控制：单轮最多处理 2 张工单，防止多次请求超时（剩余工单将在下个 8 分钟周期处理，满足 20 分钟时限）
+    var MAX_BATCH = 2;
+    var totalCount = toClaim.length;
+    if (totalCount > MAX_BATCH) {
+      toClaim = toClaim.slice(0, MAX_BATCH);
+      console.log("[" + dateStr + " " + timeStr + "] 发现 " + totalCount + " 个待接新工单，本轮优先处理前 " + MAX_BATCH + " 个，剩余将在下次轮询自动接取。");
+    } else {
+      console.log("[" + dateStr + " " + timeStr + "] 发现 " + totalCount + " 个待接新工单，正在执行自动接单与二次确认...");
+    }
+
     processOrdersSequentially(toClaim, 0);
   });
+
+  // 工作台 GET 查询（带单次重试逻辑）
+  function fetchWorkBenchWithRetry(attempt, maxAttempts, onSuccess) {
+    $httpClient.get({
+      url: queryUrl,
+      timeout: 8,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+      }
+    }, function (error, response, body) {
+      if (error || !response || response.status < 200 || response.status >= 300) {
+        var failDesc = error ? String(error) : ("HTTP " + (response ? response.status : "无响应"));
+        if (attempt < maxAttempts) {
+          console.log("[" + dateStr + " " + timeStr + "] 工作台查询初次异常 (" + failDesc + ")，1秒后自动重试...");
+          var retryFn = function () {
+            fetchWorkBenchWithRetry(attempt + 1, maxAttempts, onSuccess);
+          };
+          if (typeof setTimeout === "function") {
+            setTimeout(retryFn, 1000);
+          } else {
+            retryFn();
+          }
+          return;
+        }
+
+        // 连续重试失败，记录并上报通知
+        var netErr = "网络请求失败: " + failDesc;
+        console.log("[" + dateStr + " " + timeStr + "] " + netErr + " (已重试)");
+        if (isWorkTime && typeof $notification !== "undefined" && $notification.post) {
+          $notification.post("【工单网络异常】", "连接供热系统失败 (重试无效)", netErr);
+        }
+        $done();
+        return;
+      }
+
+      onSuccess(body);
+    });
+  }
 
   // 解析 myWork.jsp 中指定函数对应的工单数组 (query1=未接单, query2=处理中)
   function parseTabOrders(html, funcName) {
@@ -187,20 +208,18 @@
       },
       body: postBody
     }, function (err, resp, data) {
-      if (err || !resp || resp.status < 200 || resp.status >= 300) {
-        var failErr = err ? String(err) : ("HTTP " + (resp ? resp.status : "无响应"));
-        console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 接单请求网络失败: " + failErr);
-        if (typeof $notification !== "undefined" && $notification.post) {
-          $notification.post("【接单请求失败】", "工单 " + (order.workordernum || workid), failErr);
-        }
-        processOrdersSequentially(orders, index + 1);
-        return;
+      var postErr = (err || !resp || resp.status < 200 || resp.status >= 300)
+        ? (err ? String(err) : ("HTTP " + (resp ? resp.status : "无响应")))
+        : null;
+
+      if (postErr) {
+        console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " POST 请求响应异常 (" + postErr + ")，立即发起状态核对确认服务端入库结果...");
       }
 
-      // 第二步：向系统发起二次查询核实，确认该工单是否真实进入“处理中(Tab 2)”
+      // 第二步：无论 POST 是否报错，均向系统发起二次查询核实（确认该工单是否真实进入“处理中(Tab 2)”）
       verifyClaimSuccess(workid, function (verified, reason) {
         if (verified) {
-          console.log("[" + dateStr + " " + timeStr + "] 工单接单状态二次核实成功！单号: " + (order.workordernum || workid));
+          console.log("[" + dateStr + " " + timeStr + "] 工单接单状态核实成功！单号: " + (order.workordernum || workid) + (postErr ? " (注: POST网络虽有波动但服务端已成功接单)" : ""));
 
           // 逐单即时持久化，并检查 write 返回值
           record.claimedIds.push(workid);
@@ -223,9 +242,10 @@
             $notification.post(title, subtitle, content);
           }
         } else {
-          console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 二次核实未通过: " + reason);
+          var failSummary = postErr ? ("网络响应异常(" + postErr + ") 且 " + reason) : reason;
+          console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 接单未确认: " + failSummary);
           if (typeof $notification !== "undefined" && $notification.post) {
-            $notification.post("【接单状态未确认】", "工单 " + (order.workordernum || workid), reason);
+            $notification.post("【接单未成功】", "工单 " + (order.workordernum || workid), failSummary);
           }
         }
 
@@ -235,7 +255,7 @@
     });
   }
 
-  // 二次查询核实工单是否已进入当前用户的“处理中”列表 (Tab 2)
+  // 二次查询核实工单是否已进入“处理中”列表 (Tab 2)
   function verifyClaimSuccess(targetWorkId, callback) {
     $httpClient.get({
       url: queryUrl,
@@ -267,7 +287,7 @@
         });
 
         if (stillPending) {
-          callback(false, "工单仍在未接单列表中，接单请求可能未被服务端执行");
+          callback(false, "工单仍在未接单列表中，接单请求未被服务端执行");
         } else {
           callback(false, "工单不在处理中列表，可能已被其他人接单或取消");
         }
