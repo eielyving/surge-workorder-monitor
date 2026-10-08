@@ -35,7 +35,7 @@
     return;
   }
 
-  // 3. 本地持久化去重记录 (带严格防 null 结构校验)
+  // 3. 本地持久化去重与待确认状态记录 (防 null 崩溃校验)
   var STORE_KEY = "workorder_claimed_records_v1";
   var record = {};
   try {
@@ -50,10 +50,13 @@
 
   // 跨天自动重置
   if (record.date !== dateStr) {
-    record = { date: dateStr, claimedIds: [] };
+    record = { date: dateStr, claimedIds: [], pendingVerifyOrders: {} };
   }
   if (!Array.isArray(record.claimedIds)) {
     record.claimedIds = [];
+  }
+  if (!record.pendingVerifyOrders || typeof record.pendingVerifyOrders !== "object") {
+    record.pendingVerifyOrders = {};
   }
 
   var claimedSet = {};
@@ -61,16 +64,18 @@
     claimedSet[String(id)] = true;
   });
 
-  // 4. 查询个人工作台（支持 1 秒延迟自动重试 1 次）
+  // 4. 查询个人工作台（单次超时 5 秒，支持 1 秒延迟自动重试 1 次）
   var queryUrl = "http://www.lygr.net:9010/zhu2/app/weixin/myWork.jsp?xcflag=&loginid=" +
                  encodeURIComponent(params.loginid) +
                  "&workType=&smallType=&bugbarstr=&bigid=";
 
   fetchWorkBenchWithRetry(1, 2, function (body) {
-    // 5. 解析未接单列表 (严格区分“列表为空”与“解析结构异常”)
+    // 5. 解析未接单列表 (query1) 与 处理中列表 (query2)
     var unassignedOrders = null;
+    var inProgressOrders = [];
     try {
       unassignedOrders = parseTabOrders(body || "", "query1");
+      inProgressOrders = parseTabOrders(body || "", "query2");
     } catch (e) {
       var parseErrMsg = "页面结构匹配失败: " + String(e.message || e);
       console.log("[" + dateStr + " " + timeStr + "] 【解析异常警告】" + parseErrMsg);
@@ -81,15 +86,15 @@
       return;
     }
 
-    // 辅助防线：同步将已在“处理中(query2)”的工单加入 claimedSet，防止状态脱节
-    try {
-      var inProgressOrders = parseTabOrders(body || "", "query2");
-      inProgressOrders.forEach(function (item) {
-        if (item && item.id) {
-          claimedSet[String(item.id)] = true;
-        }
-      });
-    } catch (_) {}
+    // 将已在“处理中”的工单加入内存去重集合
+    inProgressOrders.forEach(function (item) {
+      if (item && item.id) {
+        claimedSet[String(item.id)] = true;
+      }
+    });
+
+    // 6. 恢复核验：检查此前因断网暂存的“待确认工单”，补发状态恢复通知
+    resolvePendingVerifications(unassignedOrders, inProgressOrders);
 
     // 非工作时段 (如夜间手动测试)
     if (!isWorkTime) {
@@ -104,7 +109,7 @@
       return;
     }
 
-    // 过滤掉今天已经确认接过的工单，并在本轮数据内按工单ID严格去重
+    // 过滤掉今天已接过的工单，并在本轮数据内按工单ID严格去重
     var seenBatchIds = {};
     var toClaim = [];
     unassignedOrders.forEach(function (order) {
@@ -121,31 +126,143 @@
       return;
     }
 
-    // FIFO 排序：优先处理最早派发的工单（按派单时间/单号升序，防旧单被新单反复延后）
+    // FIFO 排序：将时间解析为数值毫秒时间戳，按最早派单优先排序
     toClaim.sort(function (a, b) {
-      var keyA = String(a.createTime || a.workordernum || a.id);
-      var keyB = String(b.createTime || b.workordernum || b.id);
-      return keyA.localeCompare(keyB);
+      var timeA = getOrderTimestamp(a);
+      var timeB = getOrderTimestamp(b);
+      if (timeA !== timeB) {
+        return timeA - timeB; // 升序：最早派发的排在最前
+      }
+      // 时间相同或缺失时，按工单ID作确定性排序
+      var idA = parseInt(a.id, 10) || String(a.id || "");
+      var idB = parseInt(b.id, 10) || String(b.id || "");
+      if (typeof idA === "number" && typeof idB === "number") {
+        return idA - idB;
+      }
+      return String(idA).localeCompare(String(idB));
     });
 
-    // 批次容量控制：单轮最多处理 2 张工单，防止多次请求超时（剩余工单将在下个 8 分钟周期依序顺延接取）
+    // 批次容量控制：单轮最多处理 2 张工单（网络最坏耗时~43秒，远小于总时限75秒）
     var MAX_BATCH = 2;
     var totalCount = toClaim.length;
     if (totalCount > MAX_BATCH) {
       toClaim = toClaim.slice(0, MAX_BATCH);
-      console.log("[" + dateStr + " " + timeStr + "] 共有 " + totalCount + " 个待接新工单，已按派单时间排序，本轮优先处理最早派单的 " + MAX_BATCH + " 个，剩余将在下次轮询顺延接取。");
+      console.log("[" + dateStr + " " + timeStr + "] 共有 " + totalCount + " 个待接新工单，已按派单时间先后排序，本轮优先处理最早派单的 " + MAX_BATCH + " 个，剩余将在下次轮询顺延接取。");
     } else {
-      console.log("[" + dateStr + " " + timeStr + "] 发现 " + totalCount + " 个待接新工单，正在按派单时间顺序执行接单与二次确认...");
+      console.log("[" + dateStr + " " + timeStr + "] 发现 " + totalCount + " 个待接新工单，正在按派单时间先后执行接单与二次确认...");
     }
 
     processOrdersSequentially(toClaim, 0);
   });
 
-  // 工作台 GET 查询（带单次 1 秒延迟自动重试逻辑）
+  // 安全提取工单派单毫秒时间戳（用于严格单调的 FIFO 排序）
+  function getOrderTimestamp(order) {
+    if (!order) return Infinity;
+
+    // 1. 尝试从 createTime 解析 (常见格式: "2026-10-08 08:45:34" 或 "2026/10/08 08:45:34")
+    if (order.createTime && typeof order.createTime === "string") {
+      var s = order.createTime.trim().replace(/-/g, "/");
+      var t = Date.parse(s);
+      if (!isNaN(t)) {
+        return t;
+      }
+      // 仅有时间部分 (如 "08:45" 或 "08:45:34")
+      if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(order.createTime.trim())) {
+        var parts = order.createTime.trim().split(":");
+        var todayT = Date.parse(dateStr.replace(/-/g, "/") + " " + parts[0] + ":" + parts[1] + ":" + (parts[2] || "00"));
+        if (!isNaN(todayT)) {
+          return todayT;
+        }
+      }
+    }
+
+    // 2. 尝试从工单号 workordernum 提取年月日时分秒时间戳 (如 "GD20261008084534141" 中提取 20261008084534)
+    if (order.workordernum && typeof order.workordernum === "string") {
+      var m = order.workordernum.match(/\d{14}/);
+      if (m) {
+        var str = m[0];
+        var y = str.substring(0, 4);
+        var mo = str.substring(4, 6);
+        var d = str.substring(6, 8);
+        var h = str.substring(8, 10);
+        var mi = str.substring(10, 12);
+        var se = str.substring(12, 14);
+        var tNum = Date.parse(y + "/" + mo + "/" + d + " " + h + ":" + mi + ":" + se);
+        if (!isNaN(tNum)) {
+          return tNum;
+        }
+      }
+    }
+
+    // 3. 缺失时间信息的工单统一排在最后
+    return Infinity;
+  }
+
+  // 检查并核验此前断网暂存的待确认工单，恢复发送通知
+  function resolvePendingVerifications(unassignedList, inProgressList) {
+    var pendingKeys = Object.keys(record.pendingVerifyOrders || {});
+    if (pendingKeys.length === 0) return;
+
+    var changed = false;
+    pendingKeys.forEach(function (wid) {
+      var pending = record.pendingVerifyOrders[wid];
+      if (!pending) return;
+
+      var inProgress = inProgressList.some(function (item) {
+        return item && String(item.id) === String(wid);
+      });
+
+      if (inProgress) {
+        // 成功自愈：服务端实际已成功进入处理中！
+        console.log("[" + dateStr + " " + timeStr + "] 待确认工单 " + wid + " 已在服务端'处理中'列表中核验确认！补发成功通知");
+        record.claimedIds.push(wid);
+        claimedSet[wid] = true;
+        delete record.pendingVerifyOrders[wid];
+        changed = true;
+
+        var title = "【自动接单恢复确认成功】" + (pending.bigName || "工单") + " - " + (pending.smallName || "");
+        var subtitle = "单号: " + (pending.workordernum || wid);
+        var content = "网络恢复核验: 此前接单已成功入库！\n目标: " + (pending.taskObject || "未知") + "\n派单时间: " + (pending.createTime || timeStr);
+
+        if (typeof $notification !== "undefined" && $notification.post) {
+          $notification.post(title, subtitle, content);
+        }
+        return;
+      }
+
+      var stillUnassigned = unassignedList.some(function (item) {
+        return item && String(item.id) === String(wid);
+      });
+
+      if (stillUnassigned) {
+        // 未接单列表中依然存在：说明此前断网时的接单请求确实未被服务端成功执行，移出暂存以便本轮重新接单
+        console.log("[" + dateStr + " " + timeStr + "] 待确认工单 " + wid + " 仍在未接单列表中，此前POST未成功，移出待确认队列允许重新接单");
+        delete record.pendingVerifyOrders[wid];
+        changed = true;
+        return;
+      }
+
+      // 既不在未接单，也不在处理中：可能已被调度取消或他人处理
+      console.log("[" + dateStr + " " + timeStr + "] 待确认工单 " + wid + " 已不在系统中，移出待确认队列");
+      delete record.pendingVerifyOrders[wid];
+      changed = true;
+      if (typeof $notification !== "undefined" && $notification.post) {
+        $notification.post("【工单状态核验】", "工单 " + (pending.workordernum || wid), "工单已不在系统中，可能已被取消或撤回");
+      }
+    });
+
+    if (changed) {
+      try {
+        $persistentStore.write(JSON.stringify(record), STORE_KEY);
+      } catch (_) {}
+    }
+  }
+
+  // 工作台 GET 查询（单次超时 5 秒，带单次 1 秒延迟自动重试逻辑）
   function fetchWorkBenchWithRetry(attempt, maxAttempts, onSuccess) {
     $httpClient.get({
       url: queryUrl,
-      timeout: 8,
+      timeout: 5,
       headers: {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
       }
@@ -232,10 +349,10 @@
 
     var claimUrl = "http://www.lygr.net:9010/zhu2/weixin/jiedanWork.action";
 
-    // 第一步：发送接单 POST 请求
+    // 第一步：发送接单 POST 请求 (超时 5 秒)
     $httpClient.post({
       url: claimUrl,
-      timeout: 8,
+      timeout: 5,
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
@@ -255,9 +372,12 @@
         if (verified) {
           console.log("[" + dateStr + " " + timeStr + "] 工单接单状态核实成功！单号: " + (order.workordernum || workid) + (postErr ? " (注: POST网络虽有波动但服务端已成功接单)" : ""));
 
-          // 逐单即时持久化，并检查 write 返回值
+          // 逐单即时持久化，若之前在 pending 队列中一并清除
           record.claimedIds.push(workid);
           claimedSet[workid] = true;
+          if (record.pendingVerifyOrders && record.pendingVerifyOrders[workid]) {
+            delete record.pendingVerifyOrders[workid];
+          }
           try {
             var saveOk = $persistentStore.write(JSON.stringify(record), STORE_KEY);
             if (!saveOk) {
@@ -276,10 +396,22 @@
             $notification.post(title, subtitle, content);
           }
         } else if (isNetworkUncertain) {
-          // 复核请求网络受阻，状态待确认（避免误报接单失败）
-          console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 状态核验网络受阻: " + reason);
+          // 复核请求网络连续中断或解析异常，保存到持久化 pending 队列，供后续轮询自愈
+          console.log("[" + dateStr + " " + timeStr + "] 工单 " + workid + " 状态核验网络受阻，加入待确认队列: " + reason);
+          record.pendingVerifyOrders[workid] = {
+            workid: workid,
+            workordernum: order.workordernum || workid,
+            bigName: order.bigName || "工单",
+            smallName: order.smallName || "",
+            taskObject: order.taskObject || "未知",
+            createTime: order.createTime || timeStr
+          };
+          try {
+            $persistentStore.write(JSON.stringify(record), STORE_KEY);
+          } catch (_) {}
+
           if (typeof $notification !== "undefined" && $notification.post) {
-            $notification.post("【接单状态待确认】", "工单 " + (order.workordernum || workid), "接单已发送但网络异常无法核对状态，系统可能已接单，请在网络恢复后查看或等待下轮检查");
+            $notification.post("【接单状态待确认】", "工单 " + (order.workordernum || workid), "接单已发出但网络异常无法核对状态，已加入待确认队列，将在下个周期自动核验并补发通知");
           }
         } else {
           var failSummary = postErr ? ("网络响应异常(" + postErr + ") 且 " + reason) : reason;
@@ -295,12 +427,12 @@
     });
   }
 
-  // 二次查询核实工单是否已进入“处理中”列表 (Tab 2)，带单次 1 秒延迟自动重试
+  // 二次查询核实工单是否已进入“处理中”列表 (Tab 2)，单次超时 5 秒，带单次 1 秒延迟自动重试
   function verifyClaimSuccess(targetWorkId, callback) {
     function doVerify(attempt) {
       $httpClient.get({
         url: queryUrl,
-        timeout: 8,
+        timeout: 5,
         headers: {
           "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
         }
@@ -319,7 +451,7 @@
             }
             return;
           }
-          callback(false, "核实请求连续网络异常(" + errTxt + ")，服务端实际状态待确认", true);
+          callback(false, "核实请求连续网络异常(" + errTxt + ")", true);
           return;
         }
 
@@ -346,7 +478,8 @@
             callback(false, "工单不在处理中列表，亦不在未接单列表", false);
           }
         } catch (eParse) {
-          callback(false, "核实解析异常: " + eParse.message, false);
+          // 若解析结构异常，判定为网络不确定（可能返回了截断的 HTML），避免直接报失败
+          callback(false, "核实解析异常: " + eParse.message, true);
         }
       });
     }
